@@ -16,13 +16,18 @@ rethinkdb = (args...) -> rethinkdb.expr(args...)
 
 # ## Utilities
 
-funcWrap = (val) ->
+funcWrap = (val) -> funcWrapArity val
+
+funcWrapArity = (val, arity) ->
+    if Array.isArray val
+        return val.map (v) -> funcWrapArity v, arity
+
     if val is undefined
         # Pass through the undefined value so it's caught by
         # the appropriate undefined checker
         return val
 
-    val = rethinkdb.expr(val)
+    val = rethinkdb.expr(val, { arity })
 
     ivarScan = (node) ->
         unless node instanceof TermBase then return false
@@ -32,9 +37,10 @@ funcWrap = (val) ->
         return false
 
     if ivarScan(val)
-        return new Func {}, (x) -> val
+        return new Func { arity }, (row) -> val
 
     return val
+
 
 hasImplicit = (args) ->
     # args is an array of (strings and arrays)
@@ -186,8 +192,8 @@ class RDBVal extends TermBase
 
     merge: (args...) -> new Merge {}, @, args.map(funcWrap)...
     between: aropt (left, right, opts) -> new Between opts, @, left, right
-    reduce: (args...) -> new Reduce {}, @, args.map(funcWrap)...
-    map: varar 1, null, (args..., funcArg) -> new Map {}, @, args..., funcWrap(funcArg)
+    reduce: (args...) -> new Reduce {}, @, funcWrapArity(args, 2)...
+    map: varar 1, null, (args..., funcArg) -> new Map {}, @, args..., funcWrapArity(funcArg, args.length + 1)
     fold: aropt (baseArg, accFuncArg, opts) -> new Fold opts, @, baseArg, funcWrap(accFuncArg)
     filter: aropt (predicate, opts) -> new Filter opts, @, funcWrap(predicate)
     concatMap: (args...) -> new ConcatMap {}, @, args.map(funcWrap)...
@@ -233,7 +239,8 @@ class RDBVal extends TermBase
     delete: aropt (opts) -> new Delete opts, @
     replace: aropt (func, opts) -> new Replace opts, @, funcWrap(func)
     do: (args...) ->
-        new FunCall {}, funcWrap(args[-1..][0]), @, args[...-1]...
+        funcArg = args.splice(-1, 1)[0]
+        new FunCall {}, funcWrapArity(funcArg, args.length + 1), @, args...
 
     default: (args...) -> new Default {}, @, args...
 
@@ -523,7 +530,7 @@ class MakeObject extends RDBOp
         for own key,val of obj
             if typeof val is 'undefined'
                 throw new err.ReqlDriverCompileError "Object field '#{key}' may not be undefined"
-            self.optargs[key] = rethinkdb.expr val, nestingDepth-1
+            self.optargs[key] = rethinkdb.expr val, nestingDepth: nestingDepth-1
         return self
 
     compose: (args, optargs) -> kved(optargs)
@@ -1077,11 +1084,13 @@ class Func extends RDBOp
         args = []
         argNums = []
         i = 0
-        while i < func.length
+        while i < (func.length or optargs.arity)
             argNums.push Func.nextVarId
             args.push new Var {}, Func.nextVarId
             Func.nextVarId++
             i++
+
+        delete optargs.arity
 
         body = func(args...)
         if body is undefined
@@ -1250,31 +1259,37 @@ class UUID extends RDBOp
 # All top level exported functions
 
 # Wrap a native JS value in an ReQL datum
-rethinkdb.expr = varar 1, 2, (val, nestingDepth=20) ->
+rethinkdb.expr = varar 1, 2, (val, options = {}) ->
+    options.nestingDepth ?= 20
+    options.arity ?= 0
+
     if val is undefined
         throw new err.ReqlDriverCompileError "Cannot wrap undefined with r.expr()."
 
-    if nestingDepth <= 0
+    if options.nestingDepth <= 0
         throw new err.ReqlDriverCompileError "Nesting depth limit exceeded."
 
-    if typeof nestingDepth isnt "number" or isNaN(nestingDepth)
-        throw new err.ReqlDriverCompileError "Second argument to `r.expr` must be a number or undefined."
+    if typeof options.nestingDepth isnt "number" or isNaN(options.nestingDepth)
+        throw new err.ReqlDriverCompileError "Second argument `nestingDepth` to `r.expr` must be a number or undefined."
+
+    if typeof options.arity isnt "number" or isNaN(options.arity)
+        throw new err.ReqlDriverCompileError "Second argument `arity` to `r.expr` must be a number or undefined."
 
     else if val instanceof TermBase
         val
     else if typeof val is 'function'
-        new Func {}, val
+        new Func { arity: options.arity }, val
     else if val instanceof Date
         new ISO8601 {}, val.toISOString()
     else if val instanceof Buffer
         new Binary val
     else if Array.isArray val
-        val = (rethinkdb.expr(v, nestingDepth - 1) for v in val)
+        val = (rethinkdb.expr(v, nestingDepth: options.nestingDepth-1) for v in val)
         new MakeArray {}, val...
     else if typeof(val) is 'number'
         new DatumTerm val
     else if Object::toString.call(val) is '[object Object]'
-        new MakeObject val, nestingDepth
+        new MakeObject val, options.nestingDepth
     else
         new DatumTerm val
 
@@ -1319,13 +1334,14 @@ rethinkdb.tableList = (args...) -> new TableList {}, args...
 rethinkdb.grant = (args...) -> new Grant {}, args...
 
 rethinkdb.do = varar 1, null, (args...) ->
-    new FunCall {}, funcWrap(args[-1..][0]), args[...-1]...
+    funcArg = args.splice(-1, 1)[0]
+    new FunCall {}, funcWrapArity(funcArg, args.length), args...
 
 rethinkdb.branch = (args...) -> new Branch {}, args...
-rethinkdb.map = varar 1, null, (args..., funcArg) -> new Map {}, args..., funcWrap(funcArg)
+rethinkdb.map = varar 1, null, (args..., funcArg) -> new Map {}, args..., funcWrapArity(funcArg, args.length)
 
 rethinkdb.group = (args...) -> new Group {}, args.map(funcWrap)...
-rethinkdb.reduce = (args...) -> new Reduce {}, args.map(funcWrap)...
+rethinkdb.reduce = (args...) -> new Reduce {}, funcWrapArity(args, 2)...
 rethinkdb.count = (args...) -> new Count {}, args.map(funcWrap)...
 rethinkdb.sum = (args...) -> new Sum {}, args.map(funcWrap)...
 rethinkdb.avg = (args...) -> new Avg {}, args.map(funcWrap)...
