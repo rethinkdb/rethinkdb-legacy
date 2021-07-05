@@ -1,16 +1,28 @@
 // Copyright 2010-2014 RethinkDB, all rights reserved.
 #include "extproc/js_job.hpp"
 
-#include <v8.h>
-#include <libplatform/libplatform.h>
+// We silence some quickjs unused parameter warnings in inlined functions.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+
+#include <quickjs.h>
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 #include <stdint.h>
+#include <limits.h>
 
 #include <limits>
+#include <unordered_map>
 
 #include "containers/archive/boost_types.hpp"
 #include "containers/archive/stl_types.hpp"
 #include "extproc/extproc_job.hpp"
+#include "logger.hpp"
 #include "math.hpp"
 #include "rdb_protocol/configured_limits.hpp"
 #include "rdb_protocol/pseudo_time.hpp"
@@ -18,136 +30,468 @@
 #include "utils.hpp"
 
 const js_id_t MIN_ID = 1;
-const js_id_t MAX_ID = std::numeric_limits<js_id_t>::max();
 
 // Picked from a hat.
 #define TO_JSON_RECURSION_LIMIT  500
 
-// Returns an empty counted_t on error.
-ql::datum_t js_to_datum(const v8::Handle<v8::Value> &value,
+struct quickjs_context;
+
+// Returns an empty datum on error.
+ql::datum_t js_to_datum(quickjs_context *ctx,
                         const ql::configured_limits_t &limits,
+                        JSValue value,
                         std::string *err_out);
 
-// Returns an empty handle on error and sets `err_out` accordingly.
-v8::Handle<v8::Value> js_from_datum(const ql::datum_t &datum,
-                                    std::string *err_out);
-
-#ifdef V8_NEEDS_BUFFER_ALLOCATOR
-class array_buffer_allocator_t : public v8::ArrayBuffer::Allocator {
-public:
-    void *Allocate(size_t length) {
-        void *data = rmalloc(length);
-        memset(data, 0, length);
-        return data;
+struct quickjs_context {
+    JSRuntime *rt;
+    JSContext *ctx;
+    JSAtom lengthAtom;
+    JSAtom valueOfAtom;
+    JSAtom ctorDateAtom;
+    JSAtom ctorRegExpAtom;
+    JSAtom prototypeAtom;
+    quickjs_context() : rt(JS_NewRuntime()), ctx(JS_NewContext(rt)) {
+        lengthAtom = JS_NewAtom(ctx, "length");
+        valueOfAtom = JS_NewAtom(ctx, "valueOf");
+        ctorDateAtom = JS_NewAtom(ctx, "Date");
+        ctorRegExpAtom = JS_NewAtom(ctx, "RegExp");
+        prototypeAtom = JS_NewAtom(ctx, "prototype");
     }
-    void *AllocateUninitialized(size_t length) {
-        return rmalloc(length);
-    }
-    void Free(void *data, UNUSED size_t length) {
-        free(data);
+    ~quickjs_context() {
+        JS_FreeAtom(ctx, prototypeAtom);
+        JS_FreeAtom(ctx, ctorRegExpAtom);
+        JS_FreeAtom(ctx, ctorDateAtom);
+        JS_FreeAtom(ctx, valueOfAtom);
+        JS_FreeAtom(ctx, lengthAtom);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
     }
 };
-#endif
 
-// Each worker process should have a single instance of this class before using the v8 API
-class js_instance_t {
-public:
-    static void run_other_tasks();
-    static void maybe_initialize_v8();
-    static v8::Isolate *isolate();
-
-private:
-    js_instance_t();
-    ~js_instance_t();
-
-    static js_instance_t *instance;
-
-    v8::Isolate *isolate_;
-
-    scoped_ptr_t<v8::Platform> platform;
-#ifdef V8_NEEDS_BUFFER_ALLOCATOR
-    array_buffer_allocator_t array_buffer_allocator;
-#endif
+struct quickjs_env {
+    quickjs_context *ctx;
+    js_id_t next_id = MIN_ID;
+    // Each JSValue holds a refcount (which gets freed in the dtor or when it gets
+    // removed from the map).
+    std::unordered_map<js_id_t, JSValue> values;
+    explicit quickjs_env(quickjs_context *_ctx) : ctx(_ctx) {}
+    ~quickjs_env() {
+        JSContext *jsctx = ctx->ctx;
+        for (auto& pair: values) {
+            JS_FreeValue(jsctx, pair.second);
+        }
+    }
 };
 
-js_instance_t *js_instance_t::instance = nullptr;
+// TODO: We could use JS_SetInterruptHandler to kill the JS operation
+// gracefully, instead of the existing worker process killing
+// mechanism.  (The impl using v8 never interrupted the JS engine
+// gracefully either.)
 
-js_instance_t::js_instance_t() {
-    v8::V8::InitializeICU();
-    platform.init(v8::platform::CreateDefaultPlatform());
-    v8::V8::InitializePlatform(platform.get());
-    v8::V8::Initialize();
-#ifdef V8_NEEDS_BUFFER_ALLOCATOR
-    v8::Isolate::CreateParams params;
-    params.array_buffer_allocator = &array_buffer_allocator;
-    isolate_ = v8::Isolate::New(params);
-#else
-    isolate_ = v8::Isolate::New();
-#endif
-    isolate_->Enter();
+std::string qjs_exception_to_string(JSContext *jsctx) {
+    JSValue exception = JS_GetException(jsctx);
+
+    size_t len;
+    const char *str = JS_ToCStringLen(jsctx, &len, exception);
+    guarantee(str != nullptr,
+        "Could not convert JS Exception ToString value to string");
+
+    std::string ret(str, len);
+
+    JS_FreeCString(jsctx, str);
+    JS_FreeValue(jsctx, exception);
+    return ret;
 }
 
-js_instance_t::~js_instance_t() {
-    isolate_->Exit();
-    isolate_->Dispose();
-    v8::V8::Dispose();
-    v8::V8::ShutdownPlatform();
+js_result_t qjs_eval(quickjs_env *env, const std::string &source,
+                     const ql::configured_limits_t &limits) {
+    const char *filename = "rethinkdb_query";
+    const int eval_flags = JS_EVAL_TYPE_GLOBAL;
+    JSContext *jsctx = env->ctx->ctx;
+    JSValue value = JS_Eval(jsctx, source.c_str(), source.size(), filename,
+        eval_flags);
+
+    js_result_t result("");
+
+    if (JS_IsException(value)) {
+        // We set the error message to the exception string value without any prefix.
+        // This matches the v8 behavior.
+        boost::get<std::string>(result) = qjs_exception_to_string(jsctx);
+
+        JS_FreeValue(jsctx, value);
+    } else {
+        if (JS_IsFunction(jsctx, value)) {
+            js_id_t id = env->next_id;
+            ++env->next_id;
+            env->values[id] = value;
+            result = id;
+
+            // Notably, we don't JS_FreeValue(jsctx, value).
+        } else {
+            ql::datum_t datum = js_to_datum(env->ctx, limits, value, &boost::get<std::string>(result));
+            if (datum.has()) {
+                result = std::move(datum);
+            }
+
+            JS_FreeValue(jsctx, value);
+        }
+    }
+
+    return result;
 }
 
-void js_instance_t::run_other_tasks() {
-    v8::platform::PumpMessageLoop(instance->platform.get(), isolate());
-}
+bool construct_js_from_datum(quickjs_env *env, const ql::datum_t & datum, JSValue *out, std::string *err_out) {
+    guarantee(datum.has());
+    JSContext *jsctx = env->ctx->ctx;
 
-v8::Isolate *js_instance_t::isolate() {
-    return instance->isolate_;
-}
+    switch (datum.get_type()) {
+    case ql::datum_t::type_t::MINVAL:
+        err_out->assign("`r.minval` cannot be passed to `r.js`.");
+        return false;
+    case ql::datum_t::type_t::MAXVAL:
+        err_out->assign("`r.maxval` cannot be passed to `r.js`.");
+        return false;
+    case ql::datum_t::type_t::R_BINARY:
+        // TODO: We could support this!  With an ArrayBuffer API?
+        err_out->assign("`r.binary` data cannot be used in `r.js`.");
+        return false;
+    case ql::datum_t::type_t::R_BOOL:
+        *out = JS_NewBool(jsctx, datum.as_bool());
+        return true;
+    case ql::datum_t::type_t::R_NULL:
+        *out = JS_NULL;
+        return true;
+    case ql::datum_t::type_t::R_NUM:
+        *out = JS_NewFloat64(jsctx, datum.as_num());
+        return true;
+    case ql::datum_t::type_t::R_STR: {
+        const datum_string_t &str = datum.as_str();
+        *out = JS_NewStringLen(jsctx, str.data(), str.size());
+    } return true;
+    case ql::datum_t::type_t::R_ARRAY: {
+        JSValue array = JS_NewArray(jsctx);
+        if (JS_IsException(array)) {
+            *err_out = "JS exception constructing new array: " + qjs_exception_to_string(jsctx);
+            JS_FreeValue(jsctx, array);
+            return false;
+        }
 
-void js_instance_t::maybe_initialize_v8() {
-    if (instance == nullptr) {
-        instance = new js_instance_t;
+        rcheck_datum(datum.arr_size() <= size_t(UINT32_MAX),
+                     ql::base_exc_t::RESOURCE,
+                     "Array over JavaScript size limit `" + std::to_string(UINT32_MAX) + "`.");
+
+        for (size_t i = 0, e = datum.arr_size(); i < e; ++i) {
+            ql::datum_t elem = datum.get(i);
+            JSValue val;
+            if (!construct_js_from_datum(env, elem, &val, err_out)) {
+                JS_FreeValue(jsctx, array);
+                return false;
+            }
+            if (JS_DefinePropertyValueUint32(jsctx, array, i, val, JS_PROP_C_W_E) < 0) {
+                *err_out = "JS error appending array element";
+                JS_FreeValue(jsctx, array);
+                return false;
+            }
+        }
+
+        *out = array;
+        return true;
+    }
+    case ql::datum_t::type_t::R_OBJECT: {
+        if (datum.is_ptype(ql::pseudo::time_string)) {
+            double epoch_time = ql::pseudo::time_to_epoch_time(datum);
+
+            JSValue globalObject = JS_GetGlobalObject(jsctx);
+            JSValue dateCtor = JS_GetProperty(jsctx, globalObject, env->ctx->ctorDateAtom);
+
+            JSValue numberArg[1] = { JS_NewFloat64(jsctx, epoch_time * 1000) };
+
+            JSValue res = JS_CallConstructor(jsctx, dateCtor, 1, numberArg);
+            if (JS_IsException(res)) {
+                *err_out = "Exception invoking Date constructor: " + qjs_exception_to_string(jsctx);
+                // TODO: Use goto's or something for cleanup logic (everywhere).
+                JS_FreeValue(jsctx, numberArg[0]);
+                JS_FreeValue(jsctx, dateCtor);
+                JS_FreeValue(jsctx, globalObject);
+                return false;
+            }
+            *out = res;
+
+            JS_FreeValue(jsctx, numberArg[0]);
+            JS_FreeValue(jsctx, dateCtor);
+            JS_FreeValue(jsctx, globalObject);
+            return true;
+        } else {
+            JSValue object = JS_NewObject(jsctx);
+
+            for (size_t i = 0, n = datum.obj_size(); i < n; ++i) {
+                auto pair = datum.get_pair(i);
+                JSValue val;
+                if (!construct_js_from_datum(env, pair.second, &val, err_out)) {
+                    JS_FreeValue(jsctx, object);
+                    return false;
+                }
+                JSAtom prop = JS_NewAtomLen(jsctx, pair.first.data(), pair.first.size());
+                if (JS_DefinePropertyValue(jsctx, object, prop, val, JS_PROP_C_W_E) < 0) {
+                    *err_out = "JS error adding object property";
+                    JS_FreeAtom(jsctx, prop);
+                    JS_FreeValue(jsctx, object);
+                    return false;
+                }
+                JS_FreeAtom(jsctx, prop);
+            }
+
+            *out = object;
+            return true;
+        }
+    }
+    case ql::datum_t::type_t::UNINITIALIZED: // fallthru
+    default:
+        err_out->assign("bad datum value in js extproc");
+        return false;
     }
 }
 
-// Wrapper around `v8::Persistent<v8::Value> >` that calls `Reset()` on destruction
-class persistent_value_t {
-public:
-    ~persistent_value_t() {
-        value.Reset();
+js_result_t qjs_call(quickjs_env *env, js_id_t id, const std::vector<ql::datum_t> &args, const ql::configured_limits_t &limits) {
+    js_result_t result("");
+    JSContext *jsctx = env->ctx->ctx;
+
+    std::vector<JSValue> jsArgs;
+    for (const ql::datum_t &datum : args) {
+        jsArgs.emplace_back();
+        if (!construct_js_from_datum(env, datum, &jsArgs.back(), &boost::get<std::string>(result))) {
+            for (JSValue val : jsArgs) {
+                JS_FreeValue(jsctx, val);
+            }
+            return result;
+        }
     }
-    v8::Persistent<v8::Value> value;
-};
 
-// Worker-side JS evaluation environment.
-class js_env_t {
-public:
-    js_env_t();
+    size_t jsArgsSize = jsArgs.size();
+    if (jsArgsSize > INT_MAX) {
+        boost::get<std::string>(result) = "JavaScript function invoked with too many arguments";
+        for (JSValue val : jsArgs) {
+            JS_FreeValue(jsctx, val);
+        }
+        return result;
+    }
 
-    js_result_t eval(const std::string &source, const ql::configured_limits_t &limits);
-    js_result_t call(js_id_t id, const std::vector<ql::datum_t> &args,
-                     const ql::configured_limits_t &limits);
-    void release(js_id_t id);
-    void run_other_tasks(uint64_t task_counter);
+    auto func_it = env->values.find(id);
+    guarantee(func_it != env->values.end(), "js_id_t not found");
+    JSValue func_obj = func_it->second;
 
-private:
-    js_id_t remember_value(const v8::Handle<v8::Value> &value);
-    const std::shared_ptr<persistent_value_t> find_value(js_id_t id);
+    JSValue globalObject = JS_GetGlobalObject(jsctx);
+    JSValue value = JS_Call(jsctx, func_obj, globalObject, jsArgsSize,
+                            reinterpret_cast<JSValueConst *>(jsArgs.data()));
+    JS_FreeValue(jsctx, globalObject);
 
-    js_id_t next_id;
-    std::map<js_id_t, std::shared_ptr<persistent_value_t> > values;
-};
+    for (JSValue val : jsArgs) {
+        JS_FreeValue(jsctx, val);
+    }
 
-// Cleans the worker process's environment when instantiated
-class js_context_t {
-public:
-    js_context_t() :
-        local_scope(js_instance_t::isolate()),
-        context(v8::Context::New(js_instance_t::isolate())),
-        scope(context) { }
+    if (JS_IsException(value)) {
+        // We set the error message to the exception string value without any prefix.
+        // This matches the v8 behavior.
+        boost::get<std::string>(result) = qjs_exception_to_string(jsctx);
+    } else {
+        if (JS_IsFunction(jsctx, value)) {
+            boost::get<std::string>(result) = "Returning functions from within `r.js` is unsupported.";
+        } else {
+            ql::datum_t datum = js_to_datum(env->ctx, limits, value, &boost::get<std::string>(result));
+            if (datum.has()) {
+                result = std::move(datum);
+            }
+        }
+    }
 
-    v8::HandleScope local_scope;
-    v8::Local<v8::Context> context;
-    v8::Context::Scope scope;
-};
+    JS_FreeValue(jsctx, value);
+
+    return result;
+}
+
+bool qjs_is_of_type(quickjs_context *ctx, JSValue value, JSAtom typ) {
+    JSContext *jsctx = ctx->ctx;
+    JSValue prototype = JS_GetPrototype(jsctx, value);
+
+    JSValue globalObject = JS_GetGlobalObject(jsctx);
+
+    JSValue jsType = JS_GetProperty(jsctx, globalObject, typ);
+    JSValue jsTypePrototype = JS_GetProperty(jsctx, jsType, ctx->prototypeAtom);
+
+    bool ret = false;
+
+    bool prototypeIsObject = JS_IsObject(prototype);
+    bool jsTypePrototypeIsObject = JS_IsObject(jsTypePrototype);
+
+    if (prototypeIsObject && jsTypePrototypeIsObject) {
+        void *p1 = JS_VALUE_GET_PTR(prototype);
+        void *p2 = JS_VALUE_GET_PTR(jsTypePrototype);
+
+        ret = p1 == p2;
+    }
+
+    JS_FreeValue(jsctx, jsTypePrototype);
+    JS_FreeValue(jsctx, jsType);
+    JS_FreeValue(jsctx, globalObject);
+    JS_FreeValue(jsctx, prototype);
+
+    return ret;
+}
+
+// TODO: We could support binary and bigint types.
+
+ql::datum_t js_make_datum(quickjs_context *qjs_ctx,
+                          int recursion_limit,
+                          const ql::configured_limits_t &limits,
+                          JSValue value,
+                          std::string *err_out) {
+    JSContext *const ctx = qjs_ctx->ctx;
+    ql::datum_t result;
+
+    if (0 == recursion_limit) {
+        err_out->assign("Recursion limit exceeded in js_to_json (circular reference?).");
+        return result;
+    }
+    --recursion_limit;
+
+    // TODO: Use JS_VALUE_GET_TAG and a switch (after testing)
+    if (JS_IsString(value)) {
+        size_t len;
+        const char *str = JS_ToCStringLen(ctx, &len, value);
+        guarantee(str != nullptr,
+            "JS_IsString was true, but JS_ToCStringLen returned nullptr");
+        result = ql::datum_t(datum_string_t(len, str));
+        JS_FreeCString(ctx, str);
+    } else if (JS_IsObject(value)) {
+        if (JS_IsArray(ctx, value)) {
+            JSValue length_value = JS_GetProperty(ctx, value, qjs_ctx->lengthAtom);
+
+            // In JavaScript, arrays can have length up to 2**32-1.
+            uint32_t length32;
+            if (!JS_IsNumber(length_value)) {
+                err_out->assign("Array length is not a number");
+            } else if (0 != JS_ToUint32(ctx, &length32, length_value)) {
+                // Quickjs JS_ToUint32 actually converts non-integral floats to integers.
+                // As well as negative values.
+                err_out->assign("Array length is not convertable to a small integer");
+            } else if (length32 < 0) {
+                err_out->assign("Array length is negative");
+            } else {
+                rcheck_array_size_value_datum(length32, limits);
+                std::vector<ql::datum_t> datum_array;
+                datum_array.reserve(length32);
+                for (uint32_t i = 0; i < length32; ++i) {
+                    JSValue elem = JS_GetPropertyUint32(ctx, value, i);
+                    ql::datum_t item = js_make_datum(qjs_ctx, recursion_limit, limits, elem, err_out);
+                    if (!item.has()) {
+                        // Result is still empty, the error message has been set
+                        JS_FreeValue(ctx, elem);
+                        return result;
+                    }
+                    datum_array.push_back(std::move(item));
+                    JS_FreeValue(ctx, elem);
+                }
+
+                result = ql::datum_t(std::move(datum_array), limits);
+            }
+
+            JS_FreeValue(ctx, length_value);
+        } else if (JS_IsFunction(ctx, value)) {
+            err_out->assign("Cannot convert function to ql::datum_t.");
+        } else if (qjs_is_of_type(qjs_ctx, value, qjs_ctx->ctorRegExpAtom)) {
+            err_out->assign("Cannot convert RegExp to ql::datum_t.");
+        } else if (qjs_is_of_type(qjs_ctx, value, qjs_ctx->ctorDateAtom)) {
+            JSValueConst argv[1];
+            JSValue valueOf = JS_Invoke(ctx, value, qjs_ctx->valueOfAtom, 0, argv);
+
+            double floatValue;
+            if (0 != JS_ToFloat64(ctx, &floatValue, valueOf)) {
+                err_out->assign("Invalid Date in JS environment");
+            } else {
+                result = ql::pseudo::make_time(floatValue * (1.0 / 1000.0), "+00:00");
+            }
+            JS_FreeValue(ctx, valueOf);
+        } else {
+            ql::datum_object_builder_t builder;
+
+            JSPropertyEnum *ptab;
+            uint32_t plen;
+
+            // We only get string properties.  The original v8 implementation didn't
+            // have symbol properties (and perhaps not even private properties).
+            if (0 != JS_GetOwnPropertyNames(ctx, &ptab, &plen, value, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
+                err_out->assign("Could not get object properties.");
+            } else {
+                for (uint32_t i = 0; i < plen; ++i) {
+                    JSAtom atom = ptab[i].atom;
+                    JSValue elem = JS_GetProperty(ctx, value, atom);
+
+                    ql::datum_t item = js_make_datum(qjs_ctx, recursion_limit, limits, elem, err_out);
+
+                    if (!item.has()) {
+                        // Result is still empty, the error message has been set
+                        JS_FreeAtom(ctx, atom);
+                        JS_FreeValue(ctx, elem);
+                        return result;
+                    }
+
+                    const char *atom_str = JS_AtomToCString(ctx, atom);
+                    if (atom_str == nullptr) {
+                        err_out->assign("Error converting JSAtom to string");
+                        JS_FreeAtom(ctx, atom);
+                        JS_FreeValue(ctx, elem);
+                        // Result is still empty.
+                        return result;
+                    }
+
+                    datum_string_t key_string(atom_str);
+                    JS_FreeCString(ctx, atom_str);
+
+                    builder.overwrite(key_string, std::move(item));
+
+                    JS_FreeAtom(ctx, atom);
+                    JS_FreeValue(ctx, elem);
+                }
+                js_free(ctx, ptab);
+
+                result = std::move(builder).to_datum();
+            }
+        }
+    } else if (JS_IsNumber(value)) {
+        double num_val;
+        int res = JS_ToFloat64(ctx, &num_val, value);
+        guarantee(res == 0, "JS_IsNumber was true but JS_ToFloat64 failed");
+        if (!risfinite(num_val)) {
+            err_out->assign("Number return value is not finite.");
+        } else {
+            result = ql::datum_t(num_val);
+        }
+    } else if (JS_IsBool(value)) {
+        int res = JS_ToBool(ctx, value);
+        guarantee(res != -1, "JS_IsBool returned true, but we have an exception");
+        result = ql::datum_t::boolean(static_cast<bool>(res));
+    } else if (JS_IsNull(value)) {
+        // Duktape had a bug where a null JS value produced an error.  The original v8
+        // implementation converted it to a null datum.  As do we.
+        result = ql::datum_t::null();
+    } else if (JS_IsUndefined(value)) {
+        // The v8 engine did have this error message
+        err_out->assign("Cannot convert javascript `undefined` to ql::datum_t.");
+    } else {
+        err_out->assign("Unhandled value type when converting to ql::datum_t.");
+    }
+
+    return result;
+}
+
+void qjs_release(quickjs_env *env, js_id_t id) {
+    auto it = env->values.find(id);
+    guarantee(it != env->values.end(),
+        "js_id_t value (function identifier) not found when releasing function");
+    JSValue value = it->second;
+    env->values.erase(it);
+    JS_FreeValue(env->ctx->ctx, value);
+}
 
 enum js_task_t {
     TASK_EVAL,
@@ -261,14 +605,6 @@ void js_job_t::worker_error() {
     extproc_job.worker_error();
 }
 
-void js_env_t::run_other_tasks(uint64_t task_counter) {
-    js_instance_t::run_other_tasks();
-    if (task_counter % 128 == 0) {
-        // Force collection of all garbage
-        js_instance_t::isolate()->LowMemoryNotification();
-    }
-}
-
 bool send_js_result(write_stream_t *stream_out, const js_result_t &js_result) {
     write_message_t wm;
     serialize<cluster_version_t::LATEST_OVERALL>(&wm, js_result);
@@ -285,8 +621,7 @@ bool send_dummy_result(write_stream_t *stream_out) {
 
 bool run_eval(read_stream_t *stream_in,
               write_stream_t *stream_out,
-              js_env_t *js_env,
-              uint64_t task_counter) {
+              quickjs_env *qjs_env) {
     std::string source;
     ql::configured_limits_t limits;
     {
@@ -301,21 +636,19 @@ bool run_eval(read_stream_t *stream_in,
 
     js_result_t js_result;
     try {
-        js_result = js_env->eval(source, limits);
+        js_result = qjs_eval(qjs_env, source, limits);
     } catch (const std::exception &e) {
         js_result = e.what();
     } catch (...) {
         js_result = std::string("encountered an unknown exception");
     }
 
-    js_env->run_other_tasks(task_counter);
     return send_js_result(stream_out, js_result);
 }
 
 bool run_call(read_stream_t *stream_in,
               write_stream_t *stream_out,
-              js_env_t *js_env,
-              uint64_t task_counter) {
+              quickjs_env *env) {
     js_id_t id;
     std::vector<ql::datum_t> args;
     ql::configured_limits_t limits;
@@ -331,28 +664,25 @@ bool run_call(read_stream_t *stream_in,
 
     js_result_t js_result;
     try {
-        js_result = js_env->call(id, args, limits);
+        js_result = qjs_call(env, id, std::move(args), limits);
     } catch (const std::exception &e) {
         js_result = e.what();
     } catch (...) {
         js_result = std::string("encountered an unknown exception");
     }
 
-    js_env->run_other_tasks(task_counter);
     return send_js_result(stream_out, js_result);
 }
 
 bool run_release(read_stream_t *stream_in,
                  write_stream_t *stream_out,
-                 js_env_t *js_env,
-                 uint64_t task_counter) {
+                 quickjs_env *env) {
     js_id_t id;
     archive_result_t res = deserialize<cluster_version_t::LATEST_OVERALL>(stream_in,
                                                                           &id);
     if (bad(res)) { return false; }
 
-    js_env->release(id);
-    js_env->run_other_tasks(task_counter);
+    qjs_release(env, id);
     return send_dummy_result(stream_out);
 }
 
@@ -363,8 +693,12 @@ bool run_exit(write_stream_t *stream_out) {
 bool js_job_t::worker_fn(read_stream_t *stream_in, write_stream_t *stream_out) {
     static uint64_t task_counter = 0;
     bool running = true;
-    js_instance_t::maybe_initialize_v8();
-    js_env_t js_env;
+
+    // We could combine these two objects quickjs_context and
+    // quickjs_env.  With previous engines, some "runtime/global
+    // context" value was held in a global variable.
+    quickjs_context context;
+    quickjs_env qjs_env(&context);
 
     while (running) {
         task_counter += 1;
@@ -377,17 +711,17 @@ bool js_job_t::worker_fn(read_stream_t *stream_in, write_stream_t *stream_out) {
 
         switch (task) {
         case TASK_EVAL:
-            if (!run_eval(stream_in, stream_out, &js_env, task_counter)) {
+            if (!run_eval(stream_in, stream_out, &qjs_env)) {
                 return false;
             }
             break;
         case TASK_CALL:
-            if (!run_call(stream_in, stream_out, &js_env, task_counter)) {
+            if (!run_call(stream_in, stream_out, &qjs_env)) {
                 return false;
             }
             break;
         case TASK_RELEASE:
-            if (!run_release(stream_in, stream_out, &js_env, task_counter)) {
+            if (!run_release(stream_in, stream_out, &qjs_env)) {
                 return false;
             }
             break;
@@ -400,360 +734,10 @@ bool js_job_t::worker_fn(read_stream_t *stream_in, write_stream_t *stream_out) {
     unreachable();
 }
 
-static void append_caught_error(std::string *err_out, const v8::TryCatch &try_catch) {
-    if (!try_catch.HasCaught()) return;
-
-    v8::String::Utf8Value exception(try_catch.Exception());
-    const char *message = *exception;
-    guarantee(message != nullptr);
-    err_out->append(message, strlen(message));
-}
-
-// The env_t runs in the context of the worker process
-js_env_t::js_env_t() :
-    next_id(MIN_ID) { }
-
-js_result_t js_env_t::eval(const std::string &source,
-                           const ql::configured_limits_t &limits) {
-    js_context_t clean_context;
-    js_result_t result("");
-    std::string *err_out = boost::get<std::string>(&result);
-
-    v8::Isolate *isolate = js_instance_t::isolate();
-
-    v8::HandleScope handle_scope(isolate);
-
-    // TODO: use an "external resource" to avoid copy?
-    v8::Handle<v8::String> src = v8::String::NewFromUtf8(isolate,
-                                                         source.data(),
-                                                         v8::String::NewStringType::kNormalString,
-                                                         source.size());
-
-    // This constructor registers itself with v8 so that any errors generated
-    // within v8 will be available within this object.
-    v8::TryCatch try_catch;
-
-    // Firstly, compilation may fail (because of say a syntax error)
-    v8::Handle<v8::Script> script = v8::Script::Compile(src);
-    if (script.IsEmpty()) {
-        // Get the error out of the TryCatch object
-        append_caught_error(err_out, try_catch);
-    } else {
-        // Secondly, evaluation may fail because of an exception generated
-        // by the code
-        v8::Handle<v8::Value> result_val = script->Run();
-        if (result_val.IsEmpty()) {
-            // Get the error from the TryCatch object
-            append_caught_error(err_out, try_catch);
-        } else {
-            // Scripts that evaluate to functions become RQL Func terms that
-            // can be passed to map, filter, reduce, etc.
-            if (result_val->IsFunction()) {
-                v8::Handle<v8::Function> func
-                    = v8::Handle<v8::Function>::Cast(result_val);
-                result = remember_value(func);
-            } else {
-                guarantee(!result_val.IsEmpty());
-
-                // JSONify result.
-                ql::datum_t datum = js_to_datum(result_val, limits, err_out);
-                if (datum.has()) {
-                    result = datum;
-                }
-            }
-        }
-    }
-
-    return result;
-}
-
-js_id_t js_env_t::remember_value(const v8::Handle<v8::Value> &value) {
-    guarantee(next_id < MAX_ID);
-    js_id_t id = next_id++;
-
-    // Save this value in a persistent handle so it isn't deallocated when
-    // its scope is destructed.
-
-    std::shared_ptr<persistent_value_t> persistent_handle(new persistent_value_t());
-    persistent_handle->value.Reset(js_instance_t::isolate(), value);
-
-    values.insert(std::make_pair(id, persistent_handle));
-    return id;
-}
-
-const std::shared_ptr<persistent_value_t> js_env_t::find_value(js_id_t id) {
-    std::map<js_id_t, std::shared_ptr<persistent_value_t> >::iterator it = values.find(id);
-    guarantee(it != values.end());
-    return it->second;
-}
-
-v8::Local<v8::Value> run_js_func(v8::Handle<v8::Function> fn,
-                                 const std::vector<ql::datum_t> &args,
-                                 std::string *err_out) {
-    v8::Isolate *isolate = js_instance_t::isolate();
-
-    v8::TryCatch try_catch;
-    v8::EscapableHandleScope scope(isolate);
-
-    // Construct receiver object.
-    v8::Handle<v8::Object> obj = v8::Object::New(isolate);
-    guarantee(!obj.IsEmpty());
-
-    // Construct arguments.
-    scoped_array_t<v8::Handle<v8::Value> > handles(args.size());
-    for (size_t i = 0; i < args.size(); ++i) {
-        handles[i] = js_from_datum(args[i], err_out);
-        if (!err_out->empty()) {
-            return v8::Handle<v8::Value>();
-        }
-    }
-
-    // Call function with environment as its receiver.
-    v8::Local<v8::Value> result = fn->Call(obj, args.size(), handles.data());
-    if (result.IsEmpty()) {
-        append_caught_error(err_out, try_catch);
-    }
-    return scope.Escape(result);
-}
-
-js_result_t js_env_t::call(js_id_t id,
-                           const std::vector<ql::datum_t> &args,
-                           const ql::configured_limits_t &limits) {
-    js_context_t clean_context;
-    js_result_t result("");
-    std::string *err_out = boost::get<std::string>(&result);
-
-    const std::shared_ptr<persistent_value_t> found_value = find_value(id);
-    guarantee(!found_value->value.IsEmpty());
-
-    v8::Isolate *isolate = js_instance_t::isolate();
-
-    v8::HandleScope handle_scope(isolate);
-
-    // Construct local handle from persistent handle
-    v8::Local<v8::Value> local_handle =
-        v8::Local<v8::Value>::New(isolate, found_value->value);
-    v8::Local<v8::Function> fn = v8::Local<v8::Function>::Cast(local_handle);
-    v8::Handle<v8::Value> value = run_js_func(fn, args, err_out);
-
-    if (!value.IsEmpty()) {
-        if (value->IsFunction()) {
-            *err_out = "Returning functions from within `r.js` is unsupported.";
-        } else {
-            // JSONify result.
-            ql::datum_t datum = js_to_datum(value, limits, err_out);
-            if (datum.has()) {
-                result = datum;
-            }
-        }
-    }
-    return result;
-}
-
-void js_env_t::release(js_id_t id) {
-    guarantee(id < next_id);
-    size_t num_erased = values.erase(id);
-    guarantee(1 == num_erased);
-}
-
-// TODO: Is there a better way of detecting circular references than a recursion limit?
-ql::datum_t js_make_datum(const v8::Handle<v8::Value> &value,
-                          int recursion_limit,
-                          const ql::configured_limits_t &limits,
-                          std::string *err_out) {
-    ql::datum_t result;
-
-    if (0 == recursion_limit) {
-        err_out->assign("Recursion limit exceeded in js_to_json (circular reference?).");
-        return result;
-    }
-    --recursion_limit;
-
-    // TODO: should we handle BooleanObject, NumberObject, StringObject?
-    v8::HandleScope handle_scope(js_instance_t::isolate());
-
-    if (value->IsString()) {
-        v8::Handle<v8::String> string = value->ToString();
-        guarantee(!string.IsEmpty());
-
-        size_t length = string->Utf8Length();
-        scoped_array_t<char> temp_buffer(length);
-        string->WriteUtf8(temp_buffer.data(), length);
-
-        try {
-            result = ql::datum_t(datum_string_t(length, temp_buffer.data()));
-        } catch (const ql::base_exc_t &ex) {
-            err_out->assign(ex.what());
-        }
-    } else if (value->IsObject()) {
-        // This case is kinda weird. Objects can have stuff in them that isn't
-        // represented in their JSON (eg. their prototype, v8 hidden fields).
-
-        if (value->IsArray()) {
-            v8::Handle<v8::Array> arrayh = v8::Handle<v8::Array>::Cast(value);
-            std::vector<ql::datum_t> datum_array;
-            datum_array.reserve(arrayh->Length());
-
-            for (uint32_t i = 0; i < arrayh->Length(); ++i) {
-                v8::Handle<v8::Value> elth = arrayh->Get(i);
-                guarantee(!elth.IsEmpty());
-
-                ql::datum_t item = js_make_datum(elth, recursion_limit, limits, err_out);
-                if (!item.has()) {
-                    // Result is still empty, the error message has been set
-                    return result;
-                }
-                datum_array.push_back(std::move(item));
-            }
-
-            result = ql::datum_t(std::move(datum_array), limits);
-        } else if (value->IsFunction()) {
-            // We can't represent functions in JSON.
-            err_out->assign("Cannot convert function to ql::datum_t.");
-        } else if (value->IsRegExp()) {
-            // We can't represent regular expressions in datums
-            err_out->assign("Cannot convert RegExp to ql::datum_t.");
-        } else if (value->IsDate()) {
-            result = ql::pseudo::make_time(value->NumberValue() / 1000,
-                                           "+00:00");
-        } else {
-            // Treat it as a dictionary.
-            v8::Handle<v8::Object> objh = value->ToObject();
-            guarantee(!objh.IsEmpty());
-            v8::Handle<v8::Array> properties = objh->GetPropertyNames();
-            guarantee(!properties.IsEmpty());
-
-            ql::datum_object_builder_t builder;
-
-            uint32_t len = properties->Length();
-            for (uint32_t i = 0; i < len; ++i) {
-                v8::Handle<v8::String> keyh = properties->Get(i)->ToString();
-                guarantee(!keyh.IsEmpty());
-                v8::Handle<v8::Value> valueh = objh->Get(keyh);
-                guarantee(!valueh.IsEmpty());
-
-                ql::datum_t item = js_make_datum(valueh, recursion_limit, limits, err_out);
-
-                if (!item.has()) {
-                    // Result is still empty, the error message has been set
-                    return result;
-                }
-
-                size_t length = keyh->Utf8Length();
-                scoped_array_t<char> temp_buffer(length);
-                keyh->WriteUtf8(temp_buffer.data(), length);
-                datum_string_t key_string(length, temp_buffer.data());
-
-                builder.overwrite(key_string, item);
-            }
-            result = std::move(builder).to_datum();
-        }
-    } else if (value->IsNumber()) {
-        double num_val = value->NumberValue();
-
-        if (!risfinite(num_val)) {
-            err_out->assign("Number return value is not finite.");
-        } else {
-            result = ql::datum_t(num_val);
-        }
-    } else if (value->IsBoolean()) {
-        result = ql::datum_t::boolean(value->BooleanValue());
-    } else if (value->IsNull()) {
-        result = ql::datum_t::null();
-    } else {
-        err_out->assign(value->IsUndefined() ?
-                       "Cannot convert javascript `undefined` to ql::datum_t." :
-                       "Unrecognized value type when converting to ql::datum_t.");
-    }
-    return result;
-}
-
-ql::datum_t js_to_datum(const v8::Handle<v8::Value> &value,
+ql::datum_t js_to_datum(quickjs_context *ctx,
                         const ql::configured_limits_t &limits,
+                        JSValue value,
                         std::string *err_out) {
-    guarantee(!value.IsEmpty());
-    guarantee(err_out != nullptr);
-
-    v8::HandleScope handle_scope(js_instance_t::isolate());
-    err_out->assign("Unknown error when converting to ql::datum_t.");
-
-    return js_make_datum(value, TO_JSON_RECURSION_LIMIT, limits, err_out);
+    return js_make_datum(ctx, TO_JSON_RECURSION_LIMIT, limits, value, err_out);
 }
 
-v8::Handle<v8::Value> js_from_datum(const ql::datum_t &datum,
-                                    std::string *err_out) {
-    guarantee(datum.has());
-
-    v8::Isolate *isolate = js_instance_t::isolate();
-
-    switch (datum.get_type()) {
-    case ql::datum_t::type_t::MINVAL:
-        err_out->assign("`r.minval` cannot be passed to `r.js`.");
-        return v8::Handle<v8::Value>();
-    case ql::datum_t::type_t::MAXVAL:
-        err_out->assign("`r.maxval` cannot be passed to `r.js`.");
-        return v8::Handle<v8::Value>();
-    case ql::datum_t::type_t::R_BINARY:
-        // TODO: In order to support this, we need to link against a static version of
-        // V8, which provides an ArrayBuffer API.
-        err_out->assign("`r.binary` data cannot be used in `r.js`.");
-        return v8::Handle<v8::Value>();
-    case ql::datum_t::type_t::R_BOOL:
-        if (datum.as_bool()) {
-            return v8::True(isolate);
-        } else {
-            return v8::False(isolate);
-        }
-    case ql::datum_t::type_t::R_NULL:
-        return v8::Null(isolate);
-    case ql::datum_t::type_t::R_NUM:
-        return v8::Number::New(isolate, datum.as_num());
-    case ql::datum_t::type_t::R_STR:
-        return v8::String::NewFromUtf8(isolate, datum.as_str().to_std().c_str());
-    case ql::datum_t::type_t::R_ARRAY: {
-        v8::Handle<v8::Array> array = v8::Array::New(isolate);
-
-        for (size_t i = 0; i < datum.arr_size(); ++i) {
-            v8::HandleScope scope(isolate);
-            v8::Handle<v8::Value> val = js_from_datum(datum.get(i), err_out);
-            if (val.IsEmpty()) {
-                // The recursive call to `js_from_datum` should have set `err_out`
-                guarantee(!err_out->empty());
-                return v8::Handle<v8::Value>();
-            }
-            array->Set(i, val);
-        }
-
-        return array;
-    }
-    case ql::datum_t::type_t::R_OBJECT: {
-        if (datum.is_ptype(ql::pseudo::time_string)) {
-            double epoch_time = ql::pseudo::time_to_epoch_time(datum);
-            v8::Handle<v8::Value> date = v8::Date::New(isolate, epoch_time * 1000);
-            return date;
-        } else {
-            v8::Handle<v8::Object> obj = v8::Object::New(isolate);
-
-            for (size_t i = 0; i < datum.obj_size(); ++i) {
-                auto pair = datum.get_pair(i);
-                v8::HandleScope scope(isolate);
-                v8::Handle<v8::Value> key = v8::String::NewFromUtf8(isolate, pair.first.to_std().c_str());
-                v8::Handle<v8::Value> val = js_from_datum(pair.second, err_out);
-                if (val.IsEmpty()) {
-                    // The recursive call to `js_from_datum` should have set `err_out`
-                    guarantee(!err_out->empty());
-                    return v8::Handle<v8::Value>();
-                }
-                guarantee(!key.IsEmpty() && !val.IsEmpty());
-                obj->Set(key, val);
-            }
-
-            return obj;
-        }
-    }
-    case ql::datum_t::type_t::UNINITIALIZED: // fallthru
-    default:
-        err_out->assign("bad datum value in js extproc");
-        return v8::Handle<v8::Value>();
-    }
-}
